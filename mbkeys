@@ -75,7 +75,7 @@ class KeyTree:
 
         isLeaf = False
 
-        if self.fullPath:
+        if hasattr(self, 'fullPath'):
             name = self.fullPath
             isLeaf = True
 
@@ -86,7 +86,7 @@ class KeyTree:
                 out += name + " "
 
             if isLeaf:
-                out += "size: %s, permanent: %s" % (self.size, "Yes" if self.expcount else "No")
+                out += "size: %s, permanent: %s" % (self.size, "No" if self.expcount == 0 else "Yes")
             else:
                 out += "size: %s, items: %d, permanent: %0.2f%%" % (self.size, self.items, 100 * (self.items - self.expcount) / self.items)
         else:
@@ -123,7 +123,6 @@ class KeyTree:
 
         keys = []
         node.grabLeafs(keys, keySequence)
-        print keys
         return keys
         
     def grabLeafs(self,leafs, path):
