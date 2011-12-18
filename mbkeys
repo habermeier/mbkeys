@@ -70,15 +70,25 @@ class KeyTree:
                 node.expcount += expIncr
 
 
-    def show(self, level, name):
+    def show(self, level = -1, name = ''):
         out = ""
+
+        isLeaf = False
+
+        if self.fullPath:
+            name = self.fullPath
+            isLeaf = True
 
         if self.items:
             if len(name) == 0:
                 out += "TOTAL: "
             else:
                 out += name + " "
-            out += "size: %s, items: %d, permanent: %0.2f%%" % (self.size, self.items, 100 * (self.items - self.expcount) / self.items)
+
+            if isLeaf:
+                out += "size: %s, permanent: %s" % (self.size, "Yes" if self.expcount else "No")
+            else:
+                out += "size: %s, items: %d, permanent: %0.2f%%" % (self.size, self.items, 100 * (self.items - self.expcount) / self.items)
         else:
             out += "empty"
 
@@ -99,6 +109,32 @@ class KeyTree:
         for nodeName, node in self.children.iteritems():
             node.report(level + 1, prefix + nodeName)
 
+    def getKeys(self, keySequence):
+
+        node = self
+        keyComp = keySequence.split('-')
+
+        for idx in range(len(keyComp)):
+            component = keyComp[idx]
+            if not component in node.children:
+                print "keySequence not found: ", keySequence
+                return
+            node = node.children[component]
+
+        keys = []
+        node.grabLeafs(keys, keySequence)
+        print keys
+        return keys
+        
+    def grabLeafs(self,leafs, path):
+
+        if len(self.children) == 0:
+            self.fullPath = path
+            leafs.append(self)
+            return
+        
+        for nodeName, node in self.children.iteritems():
+            node.grabLeafs(leafs, path + '-' + nodeName)
 
     def saveToFile(self, fileName):
         file = open(fileName, 'wb')
@@ -110,6 +146,10 @@ class KeyTree:
         obj = cPickle.load(file)
         file.close()
         return obj
+
+    @staticmethod
+    def sortList(list):
+        list.sort(lambda n1, n2: n1.size - n2.size)
 
 def findCmd(cmdName):
     cmd_dir = os.path.dirname(sys.argv[0])
@@ -228,6 +268,8 @@ def main():
                       help="Bucket name to get")
     parser.add_option("-d", "--dir", default=None,
                       help="Directories that contain the db files for the specified bucket via -t")
+    parser.add_option("-k", "--key", default=None,
+                      help="Look for a keys starting with they KEY substring, and dump all those keys")
 
     opts, db_filenames = parser.parse_args()
 
@@ -254,7 +296,12 @@ def main():
     if opts.save:
         keyTree.saveToFile(opts.save);
 
-    keyTree.report()
+    if opts.key:
+        keys = keyTree.getKeys(opts.key)
+        KeyTree.sortList(keys)
+        map(lambda node: node.show(), keys)
+    else:
+        keyTree.report()
 
 if __name__ == '__main__':
     main()
