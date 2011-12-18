@@ -167,7 +167,9 @@ def hitDBFiles(opts, db_filenames, keyTree):
         run_sql(sqlite, db_name, "PRAGMA journal_mode=DELETE;")
 
     # Open the first given filename as the main database
-    db = sqlite3.connect(':memory:')
+    #db = sqlite3.connect(':memory:')
+    
+    db = sqlite3.connect(db_filenames[0]) # save memory by hitting disk
     # Attach the remaining files
     db.executemany("attach ? as ?", zip(db_filenames, attached_dbs))
     # Find all the tables
@@ -209,6 +211,7 @@ def hitDBFiles(opts, db_filenames, keyTree):
                    count += 1
                    if opts.max and count >= opts.max:
                        return keyTree
+    db.close()
     return keyTree
 
 def main():
@@ -232,12 +235,12 @@ def main():
         parser.print_usage()
         sys.exit("You need to provide either [-t <type> -d <d1,d2,...>] or [-l <load ds file>] options")
         
-    keyTree = None 
+    keyTree = KeyTree()
+
     if opts.load:
         keyTree = KeyTree().readFromFile(opts.load)
-    else:
-        keyTree = KeyTree()
 
+    if opts.type and opts.dir:
         dirs = opts.dir.split(',')
         for idx in range(len(dirs)):
             db_filenames = []
@@ -247,8 +250,9 @@ def main():
             db_filenames += glob.glob(dir)
             print "# going for the following DB:", db_filenames
             keyTree = hitDBFiles(opts, db_filenames, keyTree)
-        if opts.save:
-            keyTree.saveToFile(opts.save);
+
+    if opts.save:
+        keyTree.saveToFile(opts.save);
 
     keyTree.report()
 
