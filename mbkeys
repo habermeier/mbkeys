@@ -1,0 +1,256 @@
+#!/usr/bin/env python
+# -*-python-*-
+
+"""
+Restore tool for Membase.
+
+"""
+
+import itertools
+import optparse
+import sys
+import os
+import subprocess
+try:
+    import sqlite3
+except:
+    print "mbkeydump requires python version 2.6 or greater"
+    sys.exit(1)
+import time
+import traceback
+import ctypes
+import cPickle
+import glob
+
+DEFAULT_THREADS = 4
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 11211
+QUEUE_SIZE = 1000
+
+class KeyTree:
+
+    def __init__(self):
+
+        self.size = 0          # total size of this node
+        self.items = 0         # total items in this node
+        self.expcount = 0      # items that expire
+        self.children = {}     # further keys that are in there
+
+
+    def addKey(self, key, size, exptime):
+
+        node = self
+
+        expIncr = exptime != 0
+
+        keyString = "%s" % ( key )
+        keyComp = keyString.split('-')
+
+        lastIdx = len(keyComp) - 1
+        nodePath = [node]
+        isDuplicate = True
+
+        # this would be the 'path' part of the key:
+        for idx in range(len(keyComp)):
+            component = keyComp[idx]
+            if not component in node.children:
+                node.children[component] = KeyTree()
+                if idx == lastIdx:
+                    isDuplicate = False
+            node = node.children[component]
+            nodePath.append(node)
+
+        # if this is a new entry, go and increment all parts of the 
+        # tree that are part of the path. 
+        if isDuplicate == False:
+            for idx in range(len(nodePath)):
+                node = nodePath[idx]
+                node.size += size
+                node.items += 1
+                node.expcount += expIncr
+
+
+    def show(self, level, name):
+        out = ""
+
+        if self.items:
+            if len(name) == 0:
+                out += "TOTAL: "
+            else:
+                out += name + " "
+            out += "size: %s, items: %d, permanent: %0.2f%%" % (self.size, self.items, 100 * (self.items - self.expcount) / self.items)
+        else:
+            out += "empty"
+
+        print out
+        
+
+    def report(self, level = 0, name = ''):
+
+        prefix = name + '-'
+
+        if len(name) == 0:
+            prefix = ''
+            name = 'TOTAL'
+
+        if len(self.children) > 1 or level == 0:
+            self.show(level, name)
+
+        for nodeName, node in self.children.iteritems():
+            node.report(level + 1, prefix + nodeName)
+
+
+    def saveToFile(self, fileName):
+        file = open(fileName, 'wb')
+        cPickle.dump(self, file, cPickle.HIGHEST_PROTOCOL)
+        file.close()
+
+    def readFromFile(self, fileName):
+        file = open(fileName, 'rb')
+        obj = cPickle.load(file)
+        file.close()
+        return obj
+
+def findCmd(cmdName):
+    cmd_dir = os.path.dirname(sys.argv[0])
+    possible = []
+    paths = [cmd_dir, os.path.join(cmd_dir, "..", "..", "bin")] + glob.glob(os.path.join(os.sep, "*", "bin"))
+    for bin_dir in paths:
+        possible = possible + [os.path.join(bin_dir, p) for p in [cmdName, cmdName + '.exe']]
+    cmdbin = [p for p in possible if os.path.exists(p)][0]
+    return cmdbin
+
+def findSqlite():
+    return findCmd('sqlite3')
+
+def run_sql(sqlite, fn, sql, more_args=[], logger=sys.stderr):
+    args = ['-batch', '-bail']
+    cmd = [sqlite] + args + more_args + [fn]
+    p = subprocess.Popen(cmd,
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    (o,e) = p.communicate(sql)
+    if p.returncode != 0:
+        logger.write("Error running query:  %s\n" % sql)
+        logger.write(e)
+        sys.exit(1)
+    return o
+
+def db_file_versions(sqlite, db_filenames):
+    rv = {}
+    for fn in db_filenames:
+        rv[fn] = version(sqlite, fn)
+    return rv
+
+def version(sqlite, fn):
+    return int(run_sql(sqlite, fn, "PRAGMA user_version;").strip())
+
+def hitDBFiles(opts, db_filenames, keyTree):
+    for fn in db_filenames:
+       if not os.path.isfile(fn):
+          sys.exit("The file doesn't exist: " + fn)
+
+    sqlite = findSqlite()
+
+    versions = db_file_versions(sqlite, db_filenames)
+    if max(versions.values()) < 2:
+        sys.exit("Either the metadata db file is not specified\n"
+                 "or the backup files need to be upgraded to version 2.\n"
+                 "Please use mbdbupgrade for upgrade or contact support.")
+
+    attached_dbs = ["db{0}".format(i) for i in xrange(len(db_filenames))]
+
+    # Backwards compatibility: Deliberately changing out of WAL mode
+    # so that older versions of SQLite can access the database files
+    for db_name in db_filenames:
+        run_sql(sqlite, db_name, "PRAGMA journal_mode=DELETE;")
+
+    # Open the first given filename as the main database
+    db = sqlite3.connect(':memory:')
+    # Attach the remaining files
+    db.executemany("attach ? as ?", zip(db_filenames, attached_dbs))
+    # Find all the tables
+    table_dbs = {}
+    cur = db.cursor()
+    for db_name in attached_dbs:
+        cur.execute("select name from %s.sqlite_master where type = 'table'" % db_name)
+        for (table_name,) in cur:
+            table_dbs.setdefault(table_name, []).append(db_name)
+
+    nodata = True
+    for kv, dbs in table_dbs.iteritems():
+        if 'kv_' in kv:
+           nodata = False
+           break
+    if nodata:
+        sys.exit("No data to be restored. Check if db files are correct.")
+
+    # Determine which db the state table is in; will error if there's more than
+    # one
+    try:
+        (state_db,) = table_dbs[u'vbucket_states']
+    except ValueError:
+        sys.exit("Unable to locate unique vbucket_states table in database files")
+
+    sql = """select k as key, length(v) as size, exptime from `{{0}}`.`{{1}}` as kv,
+                 `{0}`.vbucket_states as vb
+                 where kv.vbucket = vb.vbid and kv.vb_version = kv.vb_version and
+                 vb.state like 'active'""".format(state_db)
+
+    count = 0
+    for kv, dbs in table_dbs.iteritems():
+        if 'kv_' in kv:
+            for db_name in dbs:
+                cur.execute(sql.format(db_name, kv))
+                for row in cur:
+                   key, size, exptime = row
+                   keyTree.addKey(key, size, exptime)
+                   count += 1
+                   if opts.max and count >= opts.max:
+                       return keyTree
+    return keyTree
+
+def main():
+    usage = "%prog [opts] [-t <type> -d <d1,d2,...>] | [-l <load ds file>] (use -h for detailed help)"
+    epilog = "Reports about key usage from backup files."
+    parser = optparse.OptionParser(usage=usage, epilog=epilog)
+    parser.add_option("-s", "--save", default=None,
+                      help="Save datastructure to file for later loading")
+    parser.add_option("-l", "--load", default=None,
+                      help="Load datastructure to file for later loading")
+    parser.add_option("-m", "--max", type="int", default=None,
+                      help="Look at the first N items from backups only")
+    parser.add_option("-t", "--type", default="default",
+                      help="Bucket name to get")
+    parser.add_option("-d", "--dir", default=None,
+                      help="Directories that contain the db files for the specified bucket via -t")
+
+    opts, db_filenames = parser.parse_args()
+
+    if opts.dir is None and opts.load is None:
+        parser.print_usage()
+        sys.exit("You need to provide either [-t <type> -d <d1,d2,...>] or [-l <load ds file>] options")
+        
+    keyTree = None 
+    if opts.load:
+        keyTree = KeyTree().readFromFile(opts.load)
+    else:
+        keyTree = KeyTree()
+
+        dirs = opts.dir.split(',')
+        for idx in range(len(dirs)):
+            db_filenames = []
+            dir = os.path.join(dirs[idx], opts.type)
+            db_filenames.append(dir)
+            dir += "-[0-9].mb"
+            db_filenames += glob.glob(dir)
+            print "# going for the following DB:", db_filenames
+            keyTree = hitDBFiles(opts, db_filenames, keyTree)
+        if opts.save:
+            keyTree.saveToFile(opts.save);
+
+    keyTree.report()
+
+if __name__ == '__main__':
+    main()
